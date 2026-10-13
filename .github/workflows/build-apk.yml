@@ -1,0 +1,85 @@
+name: Build APK
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android platform 35 and build tools
+        run: |
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          SDKMANAGER=$(find "$ANDROID_SDK_ROOT/cmdline-tools" -path "*bin/sdkmanager" -type f | sort -r | head -n 1)
+          echo "Using $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Build debug APK
+        run: |
+          set -o pipefail
+          gradle :app:assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: RedGIF-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Report compile errors as annotations
+        if: failure()
+        run: |
+          python3 - <<'PY'
+          import re, os
+          root = os.getcwd() + "/"
+          count = 0
+          with open("build.log", errors="replace") as f:
+              lines = f.read().splitlines()
+          for i, line in enumerate(lines):
+              m = re.match(r"^e: (?:file://)?(.+?):(\d+):(\d+) (.*)$", line)
+              if m and count < 200:
+                  path = m.group(1).replace(root, "")
+                  msg = m.group(4).replace("%", "%25").replace("\r", "").replace("\n", " ")
+                  print(f"::error file={path},line={m.group(2)},col={m.group(3)}::{msg}")
+                  count += 1
+                  continue
+              if re.search(r"What went wrong|Could not (resolve|find|determine)|> Task .* failed|FAILURE", line) and count < 200:
+                  nxt = " ".join(lines[i+1:i+3]).strip()
+                  print(f"::error::{(line + ' ' + nxt).replace('%', '%25')[:900]}")
+                  count += 1
+          print(f"Reported {count} errors")
+          PY
